@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Every flower blooms in its own time</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0e0622; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: manipulation; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* ==========================================================
+   Every flower blooms in its own time
+   A browser version of the bouquet. Works on desktop and phones.
+   Tap / click or press R to replay.  Add ?seed=123 for a fixed bouquet.
+   ========================================================== */
+
+// ---------- configuration ----------
+const LW = 1280, LH = 860;                          // logical design size
+const GATHER = [LW * 0.5, LH * 0.80];               // where stems meet
+const FOCAL  = [LW * 0.5, LH * 0.42];               // centre of the bouquet
+const ARR_RX = 235, ARR_RY = 195;
+const STEM_START = 2.0, BLOOM_START = 7.0, BLOOM_STAGGER = 0.75;
+const MESSAGE = ["Every flower blooms in its own time,", "just like beautiful moments in life."];
+
+// ---------- palette ----------
+const C = {
+  bgTop: [14, 6, 34], bgBot: [52, 18, 78],
+  stem: [84, 146, 98], leafL: [140, 206, 146], leafD: [46, 104, 74],
+  rosePink: [236, 110, 140], rosePinkIn: [250, 180, 196],
+  roseRed: [186, 30, 58], roseRedIn: [222, 80, 100],
+  lily: [252, 248, 252], lilyBlush: [246, 212, 228],
+  tulipP: [136, 74, 182], tulipL: [206, 168, 240],
+  tulipPk: [226, 120, 170], tulipRose: [248, 190, 215],
+  daisy: [253, 251, 246], daisyCream: [246, 238, 224], daisyC: [252, 206, 90],
+  breath: [242, 238, 252], ribbon: [240, 160, 190], ribbonD: [196, 110, 146],
+  star: [255, 244, 255], white: [255, 255, 255],
+};
+
+// ---------- random + math helpers ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+let rnd = Math.random;                                  // replaced per scene (seeded)
+const U = (a, b) => a + (b - a) * rnd();
+const pick = arr => arr[Math.floor(rnd() * arr.length)];
+
+const clamp = (x, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const lerpPt = (p, q, t) => [lerp(p[0], q[0], t), lerp(p[1], q[1], t)];
+const mix = (a, b, t) => a.map((v, i) => v + (b[i] - v) * clamp(t));
+const shade = (c, f) => c.map(v => Math.max(0, Math.min(255, v * f)));
+const rgb = (c, a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+const prog = (t, start, dur) => clamp((t - start) / dur);
+const easeOut = x => 1 - Math.pow(1 - x, 3);
+const smooth = x => x * x * (3 - 2 * x);
+
+function cubic(p0, p1, p2, p3, t) {
+  const u = 1 - t;
+  const a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+  return [a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0],
+          a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1]];
+}
+
+// Petal / leaf outline: two cubic Bezier sides meeting at the tip
+function petal(cx, cy, th, L, Wd, curl = 0, steps = 10) {
+  const dx = Math.cos(th), dy = Math.sin(th), nx = -dy, ny = dx;
+  const base = [cx, cy], tip = [cx + dx * L, cy + dy * L];
+  const side = s => {
+    const w = Wd * s, sh = curl * L * s;
+    const c1 = [cx + dx * L * 0.2 + nx * w * 0.95, cy + dy * L * 0.2 + ny * w * 0.95];
+    const c2 = [cx + dx * L * 0.9 + nx * (w + sh), cy + dy * L * 0.9 + ny * (w + sh)];
+    const out = [];
+    for (let i = 0; i <= steps; i++) out.push(cubic(base, c1, c2, tip, i / steps));
+    return out;
+  };
+  const left = side(1), right = side(-1).reverse();
+  return left.concat(right.slice(1));
+}
+
+const squash = (pts, cy, k) => pts.map(([x, y]) => [x, cy + (y - cy) * k]);
+
+function fillPoly(ctx, pts, fill, edge) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.closePath();
+  ctx.fillStyle = rgb(fill);
+  ctx.fill();
+  if (edge) { ctx.strokeStyle = rgb(edge); ctx.lineWidth = 1; ctx.stroke(); }
+}
+
+// Soft glow sprite, rendered once to an offscreen canvas
+function makeGlow(radius, color, maxA) {
+  const cv = document.createElement("canvas");
+  cv.width = cv.height = radius * 2;
+  const g = cv.getContext("2d");
+  const grad = g.createRadialGradient(radius, radius, 0, radius, radius, radius);
+  grad.addColorStop(0, rgb(color, maxA / 255));
+  grad.addColorStop(0.35, rgb(color, (maxA / 255) * 0.35));
+  grad.addColorStop(1, rgb(color, 0));
+  g.fillStyle = grad;
+  g.fillRect(0, 0, radius * 2, radius * 2);
+  return cv;
+}
+
+// ---------- botanical parts ----------
+function drawLeaf(ctx, base, ang, len, ratio = 0.22) {
+  if (len < 2) return;
+  const [bx, by] = base;
+  fillPoly(ctx, petal(bx, by, ang, len, len * ratio, 0.06, 8), C.leafD);
+  fillPoly(ctx, petal(bx, by, ang, len * 0.92, len * ratio * 0.5, 0, 6), C.leafL);
+  const tip = [bx + Math.cos(ang) * len * 0.85, by + Math.sin(ang) * len * 0.85];
+  ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(tip[0], tip[1]);
+  ctx.strokeStyle = rgb(mix(C.leafL, C.white, 0.35)); ctx.lineWidth = 1; ctx.stroke();
+}
+
+function drawBud(ctx, pos, color) {
+  const [x, y] = pos;
+  fillPoly(ctx, petal(x, y + 6, -Math.PI / 2, 16, 5, 0, 6), C.leafD);
+  ctx.beginPath();
+  ctx.ellipse(x, y, 6, 9, 0, 0, Math.PI * 2);
+  ctx.fillStyle = rgb(color); ctx.fill();
+  ctx.strokeStyle = rgb(shade(color, 0.7)); ctx.lineWidth = 1; ctx.stroke();
+}
+
+function drawRibbon(ctx, knot, g) {
+  if (g <= 0) return;
+  const [kx, ky] = knot;
+  const tails = [
+    petal(kx, ky, Math.PI / 2 + 0.22, 80 * g, 9 * g, 0, 8),
+    petal(kx, ky, Math.PI / 2 - 0.25, 72 * g, 9 * g, 0, 8),
+  ];
+  const loops = [
+    petal(kx, ky, Math.PI + 0.45, 62 * g, 22 * g, 0, 10),
+    petal(kx, ky, -0.45, 62 * g, 22 * g, 0, 10),
+  ];
+  for (const p of tails.concat(loops)) fillPoly(ctx, p, C.ribbon, C.ribbonD);
+  const band = [[kx - 46 * g, ky - 9], [kx + 46 * g, ky - 13], [kx + 46 * g, ky + 5], [kx - 46 * g, ky + 9]];
+  fillPoly(ctx, band, C.ribbon, C.ribbonD);
+  ctx.beginPath(); ctx.moveTo(kx - 40 * g, ky - 9); ctx.lineTo(kx + 40 * g, ky - 13);
+  ctx.strokeStyle = "rgb(255,226,238)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.beginPath(); ctx.arc(kx, ky, Math.max(2, 5 * g), 0, Math.PI * 2);
+  ctx.fillStyle = rgb(C.ribbonD); ctx.fill();
+}
+
+// ---------- stems ----------
+class Stem {
+  constructor(scatter, final, bend, thick) {
+    this.scatter = scatter; this.final = final; this.head = scatter;
+    this.bend = bend; this.thick = thick;
+    this.phase = U(0, Math.PI * 2);
+    this.swayRot = 0;
+    this.growStart = STEM_START + U(0, 1.0);
+    this.growDur = U(3.0, 3.6);
+    this.leaves = [];
+    const n = rnd() < 0.5 ? 2 : 3;
+    for (let i = 0; i < n; i++) {
+      this.leaves.push({
+        u: U(0.28, 0.72), side: rnd() < 0.5 ? -1 : 1,
+        len: U(34, 48), start: U(5.0, 7.5), dur: U(1.8, 2.4),
+      });
+    }
+  }
+  controls() {
+    const p0 = GATHER, p3 = this.head;
+    const p1 = [lerp(p0[0], p3[0], 0.3) + this.bend, lerp(p0[1], p3[1], 0.3)];
+    const p2 = [lerp(p0[0], p3[0], 0.7) - this.bend * 0.5, lerp(p0[1], p3[1], 0.7)];
+    return [p0, p1, p2, p3];
+  }
+  draw(ctx, grow) {
+    if (grow <= 0) return;
+    const c = this.controls(), n = 40;
+    ctx.lineCap = "round";
+    ctx.strokeStyle = rgb(C.stem);
+    let prev = cubic(c[0], c[1], c[2], c[3], 0);
+    for (let i = 1; i <= n; i++) {
+      const p = cubic(c[0], c[1], c[2], c[3], grow * i / n);
+      ctx.lineWidth = Math.max(1, this.thick * (1 - 0.5 * i / n));
+      ctx.beginPath(); ctx.moveTo(prev[0], prev[1]); ctx.lineTo(p[0], p[1]); ctx.stroke();
+      prev = p;
+    }
+  }
+  drawLeaves(ctx, t) {
+    const c = this.controls();
+    for (const lf of this.leaves) {
+      const g = smooth(prog(t, lf.start, lf.dur));
+      if (g <= 0) continue;
+      const base = cubic(c[0], c[1], c[2], c[3], lf.u);
+      const ahead = cubic(c[0], c[1], c[2], c[3], Math.min(1, lf.u + 0.02));
+      const ang = Math.atan2(ahead[1] - base[1], ahead[0] - base[0]) + lf.side * 0.85;
+      drawLeaf(ctx, base, ang, lf.len * easeOut(g));
+    }
+  }
+}
+
+// ---------- flowers ----------
+class Flower {
+  constructor(size) {
+    this.size = U(size[0], size[1]);
+    this.rot = U(0, Math.PI * 2);
+    this.tilt = U(0.8, 0.95);
+    this.bud = C.rosePink;
+    this.layer = 0;
+    this.final = FOCAL; this.stem = null; this.pos = GATHER;
+    this.bloomStart = 0; this.bloomDur = 3; this.sparkled = false;
+  }
+}
+
+class Rose extends Flower {
+  constructor(pink) {
+    super([44, 54]);
+    this.layer = 4;
+    this.outer = pink ? C.rosePink : C.roseRed;
+    this.inner = pink ? C.rosePinkIn : C.roseRedIn;
+    this.bud = this.outer;
+    this.tilt = U(0.75, 0.9);
+  }
+  draw(ctx, [x, y], op, sway) {
+    const s = this.size, o = 0.25 + 0.75 * op, th0 = this.rot + sway;
+    const rings = [
+      [5, 1.00, 0, this.outer],
+      [5, 0.78, Math.PI / 5, mix(this.outer, C.white, 0.15)],
+      [4, 0.55, 0, this.inner],
+    ];
+    for (const [count, mul, off, col] of rings) {
+      const L = s * mul * o;
+      for (let i = 0; i < count; i++) {
+        const th = th0 + off + Math.PI * 2 * i / count;
+        const pts = squash(petal(x, y, th, L, L * 0.46, 0.05, 10), y, this.tilt);
+        fillPoly(ctx, pts, col, shade(col, 0.6));
+      }
+    }
+    for (let k = 0; k < 4; k++) {
+      const r = s * 0.30 * (1 - 0.22 * k) * o;
+      if (r < 2) break;
+      ctx.beginPath();
+      ctx.ellipse(x, y, r, r * this.tilt, 0, 0, Math.PI * 2);
+      ctx.strokeStyle = rgb(mix(this.outer, this.inner, 0.2 * k)); ctx.lineWidth = 2; ctx.stroke();
+    }
+  }
+}
+
+class Lily extends Flower {
+  constructor() {
+    super([46, 54]);
+    this.layer = 3;
+    this.bud = C.lilyBlush;
+    this.tilt = U(0.8, 0.95);
+  }
+  draw(ctx, [x, y], op, sway) {
+    const s = this.size, o = 0.2 + 0.8 * op, th0 = this.rot + sway;
+    const rings = [
+      [3, 1.00, 0, mix(C.lily, C.lilyBlush, 0.35), 0.20, true],
+      [3, 0.84, Math.PI / 3, C.lily, 0.17, false],
+    ];
+    for (const [count, mul, off, col, ratio, spots] of rings) {
+      const L = s * mul * o;
+      for (let i = 0; i < count; i++) {
+        const th = th0 + off + Math.PI * 2 * i / count;
+        const pts = squash(petal(x, y, th, L, L * ratio, 0.04, 10), y, this.tilt);
+        fillPoly(ctx, pts, col, shade(col, 0.88));
+        if (spots) for (const f of [0.40, 0.62]) {
+          ctx.beginPath();
+          ctx.arc(x + Math.cos(th) * L * f, y + Math.sin(th) * L * f * this.tilt, 1.2, 0, Math.PI * 2);
+          ctx.fillStyle = rgb([200, 84, 144]); ctx.fill();
+        }
+      }
+    }
+    for (let i = 0; i < 6; i++) {
+      const th = th0 + i * Math.PI * 2 / 6 + 0.2, L = s * 0.55 * o;
+      const ex = x + Math.cos(th) * L, ey = y + Math.sin(th) * L * this.tilt;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(ex, ey);
+      ctx.strokeStyle = "rgb(246,224,170)"; ctx.lineWidth = 1; ctx.stroke();
+      ctx.beginPath(); ctx.arc(ex, ey, 2, 0, Math.PI * 2);
+      ctx.fillStyle = "rgb(214,128,60)"; ctx.fill();
+    }
+  }
+}
+
+class Tulip extends Flower {
+  constructor(purple) {
+    super([38, 44]);
+    this.layer = 2;
+    this.dark = purple ? C.tulipP : C.tulipPk;
+    this.light = purple ? C.tulipL : C.tulipRose;
+    this.bud = this.dark;
+    this.tilt = 1;
+  }
+  draw(ctx, [x, y], op, sway) {
+    const s = this.size;
+    const base = [x, y + s * 0.10];
+    const spread = lerp(0.22, 0.62, op);
+    const L = s * lerp(0.75, 1.05, op);
+    const Wd = s * 0.32 * lerp(0.7, 1.0, op);
+    const up = -Math.PI / 2 + sway * 0.6;
+    for (const [th, col] of [[up - spread, this.dark], [up + spread, this.dark], [up, this.light]]) {
+      fillPoly(ctx, petal(base[0], base[1], th, L, Wd, 0, 8), col, shade(col, 0.6));
+    }
+    ctx.beginPath(); ctx.moveTo(base[0], base[1]);
+    ctx.lineTo(base[0] + Math.cos(up) * L * 0.75, base[1] + Math.sin(up) * L * 0.75);
+    ctx.strokeStyle = rgb(mix(this.light, C.white, 0.5)); ctx.lineWidth = 1; ctx.stroke();
+  }
+}
+
+class Daisy extends Flower {
+  constructor() {
+    super([27, 33]);
+    this.layer = 1;
+    this.bud = C.daisy;
+    this.tilt = U(0.8, 0.92);
+  }
+  draw(ctx, [x, y], op, sway) {
+    const s = this.size, o = 0.2 + 0.8 * op, th0 = this.rot + sway;
+    const rings = [[16, 1.0, 0, C.daisy], [12, 0.74, Math.PI / 16, C.daisyCream]];
+    for (const [count, mul, off, col] of rings) {
+      const L = s * mul * o;
+      for (let i = 0; i < count; i++) {
+        const th = th0 + off + Math.PI * 2 * i / count;
+        const pts = squash(petal(x, y, th, L, L * 0.15, 0, 6), y, this.tilt);
+        fillPoly(ctx, pts, col, shade(col, 0.82));
+      }
+    }
+    const r = Math.max(2, s * 0.22 * o);
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = rgb(C.daisyC); ctx.fill();
+    ctx.strokeStyle = rgb(shade(C.daisyC, 0.7)); ctx.lineWidth = 1; ctx.stroke();
+  }
+}
+
+class Breath extends Flower {
+  constructor() {
+    super([70, 82]);
+    this.layer = 0;
+    this.bud = C.breath;
+    this.clusters = [];
+    for (let i = 0; i < 24; i++) {
+      const a = U(0, Math.PI * 2), d = Math.sqrt(rnd());
+      this.clusters.push([Math.cos(a) * d, Math.sin(a) * d * 0.75, U(0.9, 1.6)]);
+    }
+  }
+  draw(ctx, [x, y], op) {
+    const s = this.size, o = 0.15 + 0.85 * op;
+    const dots = this.clusters.map(([dx, dy, r]) => [x + dx * s * o, y + dy * s * o, r]);
+    ctx.strokeStyle = "rgb(196,186,222)"; ctx.lineWidth = 1;
+    for (const [px, py] of dots) {
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(px, py); ctx.stroke();
+    }
+    ctx.fillStyle = rgb(C.breath);
+    for (const [px, py, r] of dots) {
+      ctx.beginPath(); ctx.arc(px, py, Math.max(1, 2 * r), 0, Math.PI * 2); ctx.fill();
+    }
+  }
+}
+
+// ---------- scene ----------
+class Scene {
+  constructor(seed, sprites) {
+    rnd = mulberry32(seed);
+    this.sprites = sprites;
+    this.stars = [];
+    for (let i = 0; i < 180; i++) {
+      this.stars.push([U(0, LW), U(0, LH), U(0.8, 2.0), U(0, Math.PI * 2), U(0.6, 2.0)]);
+    }
+    this.sparkles = [];
+    this.flowers = this.build();
+
+    const bloomEnd = Math.max(...this.flowers.map(f => f.bloomStart + f.bloomDur));
+    this.arrStart = bloomEnd + 1.0;
+    this.arrDur = 5.0;
+    this.ribbonStart = this.arrStart + this.arrDur - 0.5;
+    this.ribbonDur = 2.4;
+    this.textStart = this.ribbonStart + this.ribbonDur + 0.8;
+    this.textDur = 4.5;
+  }
+
+  build() {
+    const flowers = [];
+    for (let i = 0; i < 5; i++) flowers.push(new Rose(i % 2 === 0));
+    for (let i = 0; i < 3; i++) flowers.push(new Lily());
+    for (let i = 0; i < 3; i++) flowers.push(new Tulip(i % 2 === 0));
+    for (let i = 0; i < 4; i++) flowers.push(new Daisy());
+    for (let i = 0; i < 3; i++) flowers.push(new Breath());
+
+    // roses at the centre, baby's breath on the outside
+    flowers.sort((a, b) => b.layer - a.layer);
+    const n = flowers.length;
+    flowers.forEach((f, i) => {
+      const r = Math.sqrt((i + 0.5) / n), a = i * 2.39996 + U(-0.15, 0.15);
+      f.final = [FOCAL[0] + Math.cos(a) * r * ARR_RX, FOCAL[1] + Math.sin(a) * r * ARR_RY];
+    });
+
+    // shuffled bloom order
+    const order = flowers.slice();
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(rnd() * (i + 1));
+      [order[i], order[j]] = [order[j], order[i]];
+    }
+    order.forEach((f, k) => {
+      f.bloomStart = BLOOM_START + k * BLOOM_STAGGER + U(0, 0.25);
+      f.bloomDur = U(2.6, 3.4);
+      const scatter = [U(LW * 0.30, LW * 0.70), U(LH * 0.40, LH * 0.62)];
+      f.stem = new Stem(scatter, f.final, U(-45, 45), U(3.0, 4.5));
+      f.pos = f.stem.head;
+    });
+    return flowers;
+  }
+
+  update(t, dt) {
+    const arr = smooth(prog(t, this.arrStart, this.arrDur));
+    for (const f of this.flowers) {
+      const st = f.stem, ph = st.phase;
+      const sx = Math.sin(t * 0.8 + ph) * 5 + Math.sin(t * 1.9 + ph * 2.3) * 1.2;
+      const sy = Math.sin(t * 0.6 + ph * 1.3) * 1.5;
+      const [hx, hy] = lerpPt(st.scatter, st.final, arr);
+      st.head = [hx + sx, hy + sy];
+      st.swayRot = Math.sin(t * 0.8 + ph) * 0.05;
+      f.pos = st.head;
+      if (!f.sparkled && t >= f.bloomStart) {
+        f.sparkled = true;
+        for (let i = 0; i < 7; i++) {
+          this.spawn(f.pos[0] + U(-25, 25), f.pos[1] + U(-25, 15), 15, 40);
+        }
+      }
+    }
+    if (rnd() < 0.3 * Math.min(1, dt * 60)) this.spawn(U(0, LW), U(0, LH), 4, 14);
+
+    this.sparkles = this.sparkles.filter(sp => {
+      sp.x += sp.vx * dt; sp.y += sp.vy * dt; sp.life -= dt;
+      return sp.life > 0;
+    });
+  }
+
+  spawn(x, y, vMin, vMax) {
+    const life = U(2.5, 5.0);
+    this.sparkles.push({
+      x, y, vx: U(-6, 6), vy: -U(vMin, vMax), life, max: life,
+      kind: pick(["white", "gold", "pink"]),
+    });
+  }
+
+  draw(ctx, t, glowAmbient) {
+    // background gradient
+    const g = ctx.createLinearGradient(0, 0, 0, LH);
+    g.addColorStop(0, rgb(C.bgTop));
+    g.addColorStop(1, rgb(C.bgBot));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, LW, LH);
+
+    // warm light near the stems
+    ctx.globalAlpha = 0.18;
+    ctx.drawImage(this.sprites.warm, GATHER[0] - 340, GATHER[1] - 340, 680, 680);
+
+    // breathing ambient light
+    ctx.globalAlpha = 0.3 + 0.12 * Math.sin(t * 0.7);
+    ctx.drawImage(this.sprites.ambient, FOCAL[0] - 470, FOCAL[1] - 470, 940, 940);
+    ctx.globalAlpha = 1;
+
+    // twinkling stars
+    const fadeIn = smooth(prog(t, 0, 2.5));
+    for (const [x, y, r, ph, sp] of this.stars) {
+      const b = fadeIn * (0.45 + 0.55 * (0.5 + 0.5 * Math.sin(t * sp + ph)));
+      ctx.beginPath(); ctx.arc(x, y, Math.max(1, r), 0, Math.PI * 2);
+      ctx.fillStyle = rgb(shade(C.star, b)); ctx.fill();
+    }
+
+    // stems, then leaves
+    for (const f of this.flowers) f.stem.draw(ctx, prog(t, f.stem.growStart, f.stem.growDur));
+    for (const f of this.flowers) f.stem.drawLeaves(ctx, t);
+
+    // ribbon
+    drawRibbon(ctx, [GATHER[0], GATHER[1] - 50], smooth(prog(t, this.ribbonStart, this.ribbonDur)));
+
+    // flowers, back to front
+    const ordered = this.flowers.slice().sort((a, b) => a.layer - b.layer);
+    for (const f of ordered) {
+      const st = f.stem;
+      if (t < f.bloomStart) {
+        if (t >= st.growStart + st.growDur) drawBud(ctx, f.pos, f.bud);
+        continue;
+      }
+      const op = easeOut(prog(t, f.bloomStart, f.bloomDur));
+      f.draw(ctx, f.pos, op, st.swayRot);
+    }
+
+    // sparkles
+    for (const sp of this.sparkles) {
+      const a = clamp(sp.life / sp.max);
+      const img = this.sprites[sp.kind];
+      ctx.globalAlpha = a;
+      ctx.drawImage(img, sp.x - img.width / 2, sp.y - img.height / 2);
+    }
+    ctx.globalAlpha = 1;
+
+    // closing message
+    if (t >= this.textStart) {
+      const alpha = smooth(prog(t, this.textStart, this.textDur));
+      ctx.globalAlpha = alpha;
+      ctx.font = "italic 26px Georgia, 'Times New Roman', serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "rgb(255,230,242)";
+      MESSAGE.forEach((line, i) => ctx.fillText(line, LW / 2, LH - 78 + i * 34));
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
+// ---------- canvas, scaling and loop ----------
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const params = new URLSearchParams(location.search);
+const SEED = params.get("seed") ? Number(params.get("seed")) : Math.floor(Math.random() * 1e9);
+
+const sprites = {
+  ambient: makeGlow(470, [196, 118, 232], 90),
+  warm: makeGlow(340, [255, 150, 190], 255),
+  white: makeGlow(7, [255, 246, 255], 255),
+  gold: makeGlow(6, [255, 220, 170], 255),
+  pink: makeGlow(7, [255, 170, 206], 255),
+};
+
+let scene = new Scene(SEED, sprites);
+let t = 0, last = performance.now();
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = window.innerWidth, h = window.innerHeight;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  // letterbox: keep the logical scene's aspect ratio, centred
+  const s = Math.min(w / LW, h / LH);
+  const ox = (w - LW * s) / 2, oy = (h - LH * s) / 2;
+  ctx.setTransform(dpr * s, 0, 0, dpr * s, dpr * ox, dpr * oy);
+}
+window.addEventListener("resize", resize);
+resize();
+
+function restart() { scene = new Scene(SEED, sprites); t = 0; }
+window.addEventListener("keydown", e => { if (e.key === "r" || e.key === "R") restart(); });
+canvas.addEventListener("pointerdown", restart);   // tap / click to replay
+
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  t += dt;
+  scene.update(t, dt);
+  ctx.fillStyle = "#0e0622";
+  ctx.fillRect(-1e4, -1e4, 2e4, 2e4);     // clear including letterbox margins
+  scene.draw(ctx, t);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(now => { last = now; frame(now); });
+</script>
+</body>
+</html>
